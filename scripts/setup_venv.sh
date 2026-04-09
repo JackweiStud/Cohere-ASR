@@ -1,12 +1,12 @@
 #!/bin/zsh
 set -euo pipefail
 
-ROOT="/Users/jackwl/Code/test"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$ROOT/.venv"
-PYTHON="/opt/homebrew/bin/python3.11"
+PYTHON="${PYTHON:-$(command -v python3.11 2>/dev/null || command -v python3 2>/dev/null || true)}"
 
-if [ ! -x "$PYTHON" ]; then
-  echo "python3.11 not found at $PYTHON" >&2
+if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+  echo "python3.11 (or python3) not found. Install it or set the PYTHON env var." >&2
   exit 1
 fi
 

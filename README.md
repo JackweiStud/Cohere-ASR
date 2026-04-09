@@ -1,176 +1,200 @@
-# Cohere Local PoC Workspace
+# Cohere Local PoC — Audio Transcription + LLM Cleanup + Summary
 
-This workspace is isolated from the main project and is only for local feasibility testing of `CohereLabs/cohere-transcribe-03-2026` on `Mac mini M4 16GB`.
+> **Language / 语言：** English | [中文](README.zh.md)
 
-It now contains one local test track:
+A self-contained local feasibility workspace for running
+[`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)
+on Apple Silicon (tested on Mac mini M4 16 GB) and piping the output through an
+LLM-based cleanup and structured Chinese summary step.
 
-- `transformers + torch + MPS`
+The workspace answers one concrete question:
+
+> Can a Mac run the Cohere model locally well enough to justify integrating a
+> `summary-only-fast` pipeline later?
+
+---
+
+## Pipeline overview
+
+```
+input/audio.wav
+    │
+    ▼
+poc_cohere_local_transcribe.py   ← local ASR (transformers + MPS)
+    │  output/transcript.txt
+    ▼
+transcript_cleanup.py            ← LLM dedup / punctuation pass
+    │  output/transcript_cleaned.txt
+    ▼
+transcript_summary.py            ← LLM structured Chinese summary
+       output/transcript_cleaned_summary.md
+```
+
+Each stage is an independent script and can be run in isolation.
+
+---
 
 ## Layout
 
 ```text
-/Users/jackwl/Code/test/
-├── .env
-├── .env.example
-├── .venv/
-├── input/
-│   └── extracted_audio.wav
-├── logs/
-├── models/
+.
+├── .env                   ← local secrets (git-ignored)
+├── .env.example           ← copy this, fill in your keys
+├── .venv/                 ← created by setup_venv.sh (git-ignored)
+├── input/                 ← put your audio files here (git-ignored)
+├── logs/                  ← runtime logs (git-ignored)
+├── models/                ← downloaded model weights (git-ignored)
 │   └── CohereLabs/
-├── output/
+├── output/                ← generated transcripts and summaries (git-ignored)
 ├── requirements.txt
 ├── scripts/
+│   ├── autoFull.sh
 │   ├── download_model.sh
 │   ├── setup_venv.sh
 │   ├── poc_cohere_local_transcribe.py
 │   ├── transcript_cleanup.py
 │   └── transcript_summary.py
-└── README.md
+├── README.md
+└── README.zh.md
 ```
 
-## Python
+---
 
-This workspace uses Python `3.11`, not the system default `3.14`, because the local ASR stack is more likely to be compatible on `3.11`.
+## Requirements
 
-## Input
+- **Python 3.11** — the local ASR stack is more compatible on 3.11 than on
+  newer versions.
+- An LLM API key for the cleanup and summary steps (see [Local env](#local-env)).
 
-Default input directory:
-
-```text
-/Users/jackwl/Code/test/input
-```
-
-Current default test file:
-
-```text
-/Users/jackwl/Code/test/input/extracted_audio.wav
-```
+---
 
 ## Setup
 
 ```bash
-cd /Users/jackwl/Code/test
 ./scripts/setup_venv.sh
 ```
 
-## Model Download
-
-Recommended local model path:
-
-```text
-/Users/jackwl/Code/test/models/CohereLabs/cohere-transcribe-03-2026
-```
-
-Download with:
+The script auto-detects `python3.11` (or falls back to `python3`). You can
+override the interpreter:
 
 ```bash
-cd /Users/jackwl/Code/test
+PYTHON=/opt/homebrew/bin/python3.11 ./scripts/setup_venv.sh
+```
+
+---
+
+## Model download
+
+```bash
 ./scripts/download_model.sh
 ```
 
-The PoC script will prefer this local path automatically.
+The model is saved to `./models/CohereLabs/cohere-transcribe-03-2026`.
+The PoC script detects this path automatically.
 
-## Local Env
+To use a mirror (e.g. inside mainland China):
 
-This test workspace no longer reads the main project's `.env`.
-
-Local cleanup settings live in:
-
-```text
-/Users/jackwl/Code/test/.env
+```bash
+HF_ENDPOINT=https://hf-mirror.com ./scripts/download_model.sh
 ```
 
-Template:
+---
 
-```text
-/Users/jackwl/Code/test/.env.example
+## Local env
+
+Copy the template and fill in your API key:
+
+```bash
+cp .env.example .env
 ```
+
+`.env.example`:
+
+```dotenv
+LLM_API_KEY=
+LLM_BASE_URL=https://api.siliconflow.cn/v1
+LLM_MODEL=deepseek-ai/DeepSeek-V3
+```
+
+`LLM_BASE_URL` and `LLM_MODEL` are optional — the defaults above are used when
+they are absent.
+
+---
 
 ## Run
 
+### Full pipeline (transcribe → cleanup → summary)
+
+The quickest way to run everything in one shot:
+
 ```bash
-cd /Users/jackwl/Code/test
-./.venv/bin/python ./scripts/poc_cohere_local_transcribe.py \
-  --input /Users/jackwl/Code/test/input/extracted_audio.wav \
-  --output-dir /Users/jackwl/Code/test/output
+./scripts/autoFull.sh
 ```
 
-Optional explicit env path:
+All options are optional — defaults are picked up automatically:
 
 ```bash
-cd /Users/jackwl/Code/test
-./.venv/bin/python ./scripts/poc_cohere_local_transcribe.py \
-  --env-path /Users/jackwl/Code/test/.env \
-  --input /Users/jackwl/Code/test/input/extracted_audio.wav \
-  --output-dir /Users/jackwl/Code/test/output
+./scripts/autoFull.sh \
+  --input    ./input/extracted_audio.wav \
+  --output   ./output \
+  --language en \
+  --model    ./models/CohereLabs/cohere-transcribe-03-2026 \
+  --env      ./.env
 ```
 
-## Cleanup Only
+`-h` / `--help` prints the full usage.
 
-You can run transcript cleanup independently:
+### Step by step
+
+If you need finer control, run each stage individually.
+
+#### Transcribe only
 
 ```bash
-cd /Users/jackwl/Code/test
+./.venv/bin/python ./scripts/poc_cohere_local_transcribe.py \
+  --input ./input/extracted_audio.wav \
+  --output-dir ./output
+```
+
+#### Cleanup only
+
+```bash
 ./.venv/bin/python ./scripts/transcript_cleanup.py \
-  --input /Users/jackwl/Code/test/output/transcript.txt \
-  --output /Users/jackwl/Code/test/output/transcript_cleaned.txt
+  --input ./output/transcript.txt \
+  --output ./output/transcript_cleaned.txt
 ```
 
-## Summary Only
-
-You can run the structured Chinese summary independently:
+### Summary only
 
 ```bash
-cd /Users/jackwl/Code/test
 ./.venv/bin/python ./scripts/transcript_summary.py \
-  --input /Users/jackwl/Code/test/output/transcript_cleaned.txt \
-  --output /Users/jackwl/Code/test/output/transcript_summary.md
+  --input ./output/transcript_cleaned.txt \
+  --output ./output/transcript_cleaned_summary.md
 ```
 
-Optional explicit model path:
+---
 
-```bash
-cd /Users/jackwl/Code/test
-./.venv/bin/python ./scripts/poc_cohere_local_transcribe.py \
-  --model-path /Users/jackwl/Code/test/models/CohereLabs/cohere-transcribe-03-2026 \
-  --input /Users/jackwl/Code/test/input/extracted_audio.wav \
-  --output-dir /Users/jackwl/Code/test/output
-```
+## Output files
 
-## What the script writes
+| File | Description |
+|------|-------------|
+| `output/transcript.txt` | Raw ASR output |
+| `output/transcript_cleaned.txt` | LLM-deduped and punctuated transcript |
+| `output/transcript_cleaned_summary.md` | Structured Chinese summary + X thread draft |
+| `output/report.json` | Runtime benchmark — model path, Python/torch version, device, audio duration, load time, transcription time, RSS |
+| `logs/poc_cohere_local_transcribe.log` | ASR run log |
+| `logs/transcript_cleanup.log` | Cleanup run log |
+| `logs/transcript_summary.log` | Summary run log |
 
-- `output/transcript.txt`
-- `output/transcript_cleaned.txt`
-- `output/transcript_summary.md`
-- `output/report.json`
-
-The report captures basic runtime facts for this machine:
-
-- selected model path
-- python version
-- torch version
-- selected device
-- input duration
-- model load time
-- transcription time
-- rough process RSS before and after
-
-The scripts also write:
-
-- `logs/poc_cohere_local_transcribe.log`
-- `logs/transcript_cleanup.log`
-- `logs/transcript_summary.log`
+---
 
 ## Notes
 
-- This PoC uses `transformers` in the version range recommended by the model card.
-- If you see multilingual garbage output, the first thing to check is whether the environment is using an unsupported `transformers` version.
-- The LLM cleanup step is an independent script and module, reused by the local Cohere PoC.
-- The LLM summary step is also independent and uses a fixed prompt for URL video transcript summarization.
-
-## Scope
-
-This workspace only answers one question:
-
-Can this Mac run the Cohere model locally well enough to justify integrating `summary-only-fast` later?
+- If you see multilingual garbage in the transcription output, the most likely
+  cause is an unsupported `transformers` version. Check `requirements.txt` for
+  the tested version range.
+- The LLM cleanup and summary steps are independent modules — they can be
+  imported or called without the ASR step.
+- The summary prompt is tuned for URL-sourced video transcripts and outputs
+  a structured claim/evidence/translation table plus an X (Twitter) thread
+  draft in Simplified Chinese.
