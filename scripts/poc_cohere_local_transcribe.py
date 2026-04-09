@@ -1,4 +1,50 @@
 #!/usr/bin/env python3
+"""本地 Cohere Transcribe PoC：加载模型、可选按体积分片、转写、拼接与报告。
+
+职责范围
+    只负责语音识别与分片转写管线。不在此脚本中做文稿清洗；清洗请单独运行
+    ``transcript_cleanup.py``（对已生成的 ``transcript.txt`` 等进行处理）。
+
+使用示例（建议在项目虚拟环境中执行）::
+    /path/to/.venv/bin/python scripts/poc_cohere_local_transcribe.py \\
+        --input input/extracted_audio.wav \\
+        --output-dir output \\
+        --language en \\
+        --split-threshold-mb 25 \\
+        --chunk-target-mb 15
+
+主要参数
+    --input              单个音频文件路径。默认 ``input/extracted_audio.wav``。当前仅接受 ``.wav``；
+                         若输入为其他格式，脚本会记录错误日志并提示先转换为 WAV。
+    --output-dir         输出目录。默认 ``output/``。
+    --model-path         可选；本地模型目录。默认优先使用
+                         ``models/CohereLabs/cohere-transcribe-03-2026``；
+                         若该目录不存在，则回退到 Hugging Face ID
+                         ``CohereLabs/cohere-transcribe-03-2026``。
+    --language           ISO 639-1 语言码。默认 ``en``。
+    --no-punctuation     关闭标点。默认关闭该开关，即保留标点。
+    --split-threshold-mb 输入文件大小（MiB）超过该值则切分；否则整段转写。默认 ``25``。
+    --chunk-target-mb    切分时，按「源文件字节/时长」估算每片时长，使分片体积大致接近该目标
+                         （近似值）。默认 ``15``。
+    --log-path           日志文件路径。默认 ``logs/poc_cohere_local_transcribe.log``。
+
+输出
+    transcript.txt        全文拼接结果（分片之间用换行连接）。
+    report.json           运行与资源等指标。
+    chunks_manifest.json  各分片路径、时间范围、体积与耗时等。
+    chunks/               切分得到的 WAV 分片（仅当发生切分时写入）。
+    transcripts/          各分片对应的纯文本。
+
+分片实现
+    使用 ``soundfile``（libsndfile）按采样率与目标秒数读帧、写 WAV；不使用 FFmpeg。
+
+注意事项
+    - ``chunk-target-mb`` 是按**源文件**平均码率估算的“约 15MB”类目标；若源为压缩格式而分片
+      落盘为 WAV，单文件实际 MiB 可能与直觉不完全一致；PCM WAV 输入时通常更接近期望。
+    - 硬切分点在时间上连续，句中截断时拼接处可能需靠后续 ``transcript_cleanup`` 微调。
+    - 当前仅接受 ``.wav`` 输入；若源文件不是 WAV，请先在上游完成抽音频/转码，再运行本脚本。
+    - 依赖 torch、transformers、soundfile、psutil 等；缺依赖时脚本会提示先配置虚拟环境。
+"""
 
 from __future__ import annotations
 
@@ -14,9 +60,13 @@ from pathlib import Path
 import psutil
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
 MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
-DEFAULT_LOCAL_MODEL_PATH = "/Users/jackwl/Code/test/models/CohereLabs/cohere-transcribe-03-2026"
-DEFAULT_LOG_PATH = "/Users/jackwl/Code/test/logs/poc_cohere_local_transcribe.log"
+DEFAULT_INPUT_PATH = PROJECT_ROOT / "input" / "extracted_audio.wav"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
+DEFAULT_LOCAL_MODEL_PATH = PROJECT_ROOT / "models" / "CohereLabs" / "cohere-transcribe-03-2026"
+DEFAULT_LOG_PATH = PROJECT_ROOT / "logs" / "poc_cohere_local_transcribe.log"
 
 
 @dataclass
@@ -313,7 +363,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Local Cohere Transcribe PoC runner")
     parser.add_argument(
         "--input",
-        default="/Users/jackwl/Code/test/input/extracted_audio.wav",
+        default=str(DEFAULT_INPUT_PATH),
         help="Path to one local audio file",
     )
     parser.add_argument(
@@ -323,7 +373,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--output-dir",
-        default="/Users/jackwl/Code/test/output",
+        default=str(DEFAULT_OUTPUT_DIR),
         help="Directory for transcript and report",
     )
     parser.add_argument(
@@ -363,6 +413,17 @@ def main() -> int:
 
     if not input_path.exists():
         print(f"Input file not found: {input_path}", file=sys.stderr)
+        return 1
+
+    if input_path.suffix.lower() != ".wav":
+        logging.error("Unsupported input format: %s", input_path.suffix or "<no suffix>")
+        logging.error("This script currently accepts only .wav input: %s", input_path)
+        print(
+            "Unsupported input format. This script currently accepts only .wav input.\n"
+            f"Input path: {input_path}\n"
+            "Suggestion: convert the source audio to WAV first, then rerun this script.",
+            file=sys.stderr,
+        )
         return 1
 
     if args.split_threshold_mb <= 0 or args.chunk_target_mb <= 0:
