@@ -1,0 +1,36 @@
+# 本地环境与密钥（保留 .env.example 供参考）
+.env
+.env.local
+.env.*.local
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 运行产物与日志
+logs/
+output/
+
+# 本地下载的模型权重（见 scripts/download_model.sh）
+models/
+
+# 系统与编辑器
+.DS_Store
+.idea/
+*.swp
+*.swo

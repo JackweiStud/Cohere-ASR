@@ -1,0 +1,10 @@
+transformers>=4.56,<5.3,!=5.0.*,!=5.1.*
+torch
+huggingface_hub
+soundfile
+librosa
+sentencepiece
+protobuf
+psutil
+numpy
+httpx
