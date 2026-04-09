@@ -1,10 +1,10 @@
 #!/bin/zsh
 set -euo pipefail
 
-ROOT="/Users/jackwl/Code/test"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$ROOT/.venv"
 MODEL_ID="CohereLabs/cohere-transcribe-03-2026"
-TARGET_DIR="$ROOT/models/CohereLabs/cohere-transcribe-03-2026"
+TARGET_DIR="$ROOT/models/$MODEL_ID"
 HF_ENDPOINT_VALUE="${HF_ENDPOINT:-https://hf-mirror.com}"
 
 if [ ! -x "$VENV/bin/python" ]; then
@@ -17,11 +17,12 @@ mkdir -p "$TARGET_DIR"
 
 echo "Using HF endpoint: $HF_ENDPOINT_VALUE"
 
-HF_ENDPOINT="$HF_ENDPOINT_VALUE" "$VENV/bin/python" - <<'PY'
+HF_ENDPOINT="$HF_ENDPOINT_VALUE" "$VENV/bin/python" - "$MODEL_ID" "$TARGET_DIR" <<'PY'
+import sys
 from huggingface_hub import snapshot_download
 
-model_id = "CohereLabs/cohere-transcribe-03-2026"
-target_dir = "/Users/jackwl/Code/test/models/CohereLabs/cohere-transcribe-03-2026"
+model_id = sys.argv[1]
+target_dir = sys.argv[2]
 
 snapshot_download(
     repo_id=model_id,
