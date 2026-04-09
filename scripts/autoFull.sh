@@ -1,5 +1,5 @@
 #!/bin/zsh
-# autoFull.sh — transcribe → summary in one shot (cleanup step is skipped)
+# autoFull.sh — transcribe → analysis pack in one shot (cleanup step is skipped)
 #
 # Usage:
 #   ./scripts/autoFull.sh [OPTIONS]
@@ -56,7 +56,7 @@ mkdir -p "$OUTPUT_DIR"
 
 PYTHON="$VENV/bin/python"
 TRANSCRIPT="$OUTPUT_DIR/transcript.txt"
-SUMMARY="$OUTPUT_DIR/transcript_summary.md"
+ANALYSIS="$OUTPUT_DIR/transcript_analysis.md"
 
 # ---------- step 1: transcribe ----------
 echo ""
@@ -87,7 +87,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 "$PYTHON" "$SCRIPTS/transcript_summary.py" \
   --input    "$TRANSCRIPT" \
-  --output   "$SUMMARY" \
+  --output   "$ANALYSIS" \
   --env-path "$ENV_PATH"
 
 # ---------- done ----------
@@ -96,5 +96,5 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo " Done"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " transcript : $TRANSCRIPT"
-echo " summary    : $SUMMARY"
+echo " analysis   : $ANALYSIS"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

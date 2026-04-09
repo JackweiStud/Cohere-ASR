@@ -5,7 +5,8 @@
 A self-contained local feasibility workspace for running
 [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)
 on Apple Silicon (tested on Mac mini M4 16 GB) and piping the output through an
-LLM-based cleanup and structured Chinese summary step.
+LLM-based cleanup plus one structured post-processing output:
+an analysis pack.
 
 The workspace answers one concrete question:
 
@@ -26,8 +27,8 @@ poc_cohere_local_transcribe.py   ← local ASR (transformers + MPS)
 transcript_cleanup.py            ← LLM dedup / punctuation pass
     │  output/transcript_cleaned.txt
     ▼
-transcript_summary.py            ← LLM structured Chinese summary
-       output/transcript_cleaned_summary.md
+transcript_summary.py            ← LLM analysis pack
+       output/transcript_cleaned_analysis.md
 ```
 
 Each stage is an independent script and can be run in isolation.
@@ -168,8 +169,15 @@ If you need finer control, run each stage individually.
 
 ```bash
 ./.venv/bin/python ./scripts/transcript_summary.py \
+  --input ./output/transcript_cleaned.txt
+```
+
+Optional: explicitly set the analysis output path:
+
+```bash
+./.venv/bin/python ./scripts/transcript_summary.py \
   --input ./output/transcript_cleaned.txt \
-  --output ./output/transcript_cleaned_summary.md
+  --output ./output/transcript_cleaned_analysis.md
 ```
 
 ---
@@ -180,7 +188,7 @@ If you need finer control, run each stage individually.
 |------|-------------|
 | `output/transcript.txt` | Raw ASR output |
 | `output/transcript_cleaned.txt` | LLM-deduped and punctuated transcript |
-| `output/transcript_cleaned_summary.md` | Structured Chinese summary + X thread draft |
+| `output/transcript_cleaned_analysis.md` | Claim/evidence/risk analysis pack + X thread draft |
 | `output/report.json` | Runtime benchmark — model path, Python/torch version, device, audio duration, load time, transcription time, RSS |
 | `logs/poc_cohere_local_transcribe.log` | ASR run log |
 | `logs/transcript_cleanup.log` | Cleanup run log |
@@ -195,6 +203,7 @@ If you need finer control, run each stage individually.
   the tested version range.
 - The LLM cleanup and summary steps are independent modules — they can be
   imported or called without the ASR step.
-- The summary prompt is tuned for URL-sourced video transcripts and outputs
-  a structured claim/evidence/translation table plus an X (Twitter) thread
-  draft in Simplified Chinese.
+- The summary stage now produces one Markdown file:
+  an analysis pack for `claim / evidence / risk` review.
+- Final Markdown is post-processed for readability, with sentence-first line
+  breaks after `. ? !` and `。？！` where possible.

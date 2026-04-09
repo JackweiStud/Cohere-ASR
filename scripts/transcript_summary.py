@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""基于转写文本生成结构化中文总结。
+"""基于转写文本生成分析包。
 
 职责范围
-    只负责读取已有的转写文本，调用配置好的 LLM 输出结构化中文总结与 X 汇报草稿。
+    只负责读取已有的转写文本，调用配置好的 LLM 输出分析包：
+    主张 / 证据 / 风险提示 / X 汇报
     不负责语音转写；语音转写请使用 ``poc_cohere_local_transcribe.py``。
     不负责 minimum-edit cleanup；转写清洗请使用 ``transcript_cleanup.py``。
 
 使用示例（建议在项目虚拟环境中执行）::
-    /path/to/.venv/bin/python scripts/transcript_summary.py \\
-        --input output/transcript_cleaned.txt \\
-        --output output/transcript_cleaned_summary.md
+    /path/to/.venv/bin/python scripts/transcript_summary.py \
+        --input output/transcript_cleaned.txt
 
 主要参数
     --input     输入转写文本路径。默认 ``output/transcript_cleaned.txt``。
-    --output    可选；输出 Markdown 路径。默认与输入同目录，文件名自动加 ``_summary.md`` 后缀。
+    --output    可选；分析包 Markdown 路径。
     --log-path  日志文件路径。默认 ``logs/transcript_summary.log``。
 
 LLM 配置
@@ -24,24 +24,8 @@ LLM 配置
     - 需要在环境变量或项目根 ``.env`` 中提供 ``LLM_API_KEY``；``LLM_BASE_URL`` 和
       ``LLM_MODEL`` 可选，不填则使用默认值。
     - 当前仅接受 ``.txt`` 输入；若输入不是文本转写结果，脚本会记录错误日志并给出建议。
-    - 本脚本使用 ``temperature=0``，尽量让总结结构稳定、可复现。
-
-内部机制原理
-    脚本按「全文字符数」做粗粒度预算（近似 token，非 tokenizer 精确值），分两条主路径：
-
-    1) 短文本直出：长度不超过 ``DIRECT_SUMMARY_CHAR_BUDGET`` 时，将整段转写填入用户
-       prompt，一次 ``/chat/completions`` 请求直接产出最终 A/B 结构 Markdown。
-
-    2) 长文本分段汇总：超过直出阈值时，先用 ``CHUNK_CHAR_BUDGET`` 在标点与空白等
-       ``CHUNK_BREAK_MARKERS`` 优先处切分，再对每段单独请求「分段摘要」；若某段仍
-       被服务端判为超长（如 413、或 400 响应体含典型上下文超限文案），则在该段内
-       递归减半拆分，直至低于 ``MIN_CHUNK_CHAR_BUDGET`` 仍失败则向上抛出。
-       所有分段摘要拼成上下文后，再发一次「汇总」请求，仅允许使用各段里已出现的
-       依据与翻译，输出与短路径相同的 A/B 最终结构。
-
-    请求与容错：``_call_llm_with_retry`` 对超时、连接类错误及 ``RETRYABLE_STATUS_CODES``
-    中的状态码做有限次指数退避重试；非可重试的 HTTP 错误或配置缺失则立即失败。
-    日志会记录分段数、重试与退化情况，便于区分「 prompt 过长」与「网络不稳定」。
+    - 本脚本使用 ``temperature=0``，尽量让输出结构稳定、可复现。
+    - 最终 Markdown 会在后处理阶段优先按 ``. ? ! 。？！`` 做断句换行，提升可读性。
 """
 
 from __future__ import annotations
@@ -62,121 +46,30 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 DEFAULT_INPUT_PATH = PROJECT_ROOT / "output" / "transcript_cleaned.txt"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "logs" / "transcript_summary.log"
-# 单次 chat/completions 请求超时（秒）
 DEFAULT_REQUEST_TIMEOUT = 300
-# 网络抖动或服务端瞬时错误时的最大重试次数（含首次请求共 N 次尝试）
 DEFAULT_MAX_RETRIES = 3
-# 全文字符数不超过此值时走单次总结；针对 SiliconFlow DeepSeek-V3（约 164K 上下文）的保守线
+MAX_GENERATION_ATTEMPTS = 2
 DIRECT_SUMMARY_CHAR_BUDGET = 48000
-# 超过直出阈值后，按该目标长度分段做「分段摘要」（按字符近似，非精确 token）
 CHUNK_CHAR_BUDGET = 24000
-# 分段仍超长需再拆时，单段不得低于此长度，避免语义切碎
 MIN_CHUNK_CHAR_BUDGET = 6000
-# 这些状态码视为可退避重试（401/403/400 等一般不重试）
+MIN_CLAIM_ITEMS = 5
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-# 切分 transcript 时在此类边界后断开，元组顺序即优先顺序（越靠前越先尝试）
 CHUNK_BREAK_MARKERS = (
     "\n\n",
     "\n",
-    "。", "！", "？",
-    ". ", "! ", "? ",
-    "；", "; ",
-    "，", ", ",
-    "、", " ",
+    "。",
+    "！",
+    "？",
+    ". ",
+    "! ",
+    "? ",
+    "；",
+    "; ",
+    "，",
+    ", ",
+    "、",
+    " ",
 )
-
-SUMMARY_SYSTEM_PROMPT = (
-    "你是一位双语信息架构师。请阅读用户提供的完整转写文本。"
-    "转写文本可能来自 ASR，可能含口误或听写错误。"
-    "请严格按照用户要求的结构输出简体中文结果，不要增加额外前言或说明。"
-)
-
-SUMMARY_USER_PROMPT_TEMPLATE = """URL 视频快速总结
-
-你是一位双语信息架构师。请阅读用户粘贴的【完整转写文本】（可能来自 ASR，含口误/听写错误）。
-
-请用简体中文输出两部分，结构严格如下：
-
-### A. 内容总结与“主张—依据—中译”
-1) 先用 5–10 句中文概括全文主线（说明这是演讲/口述/推广/教程中的哪一种语气也可）。
-2) 提取 5–8 条“核心观点/主张”。每条必须包含：
-   - 主张标题（简短）
-   - 主张说明（1–3 句中文）
-   - 依据：1–2 段【转写原文英文摘录】（尽量是连续短语/句子，不要编造）
-   - 对应【中文翻译】（忠实直译为主，专有名词不确定则标注“疑似：…”）
-
-要求：
-- 不要把营销数字（例如节省 X 小时）当成事实；若出现，标注为“演讲者声称/需核验”。
-- 若你发现明显的 ASR 误差，在段末用括注提示“疑似听写：…→…”不要展开全文纠错表（除非用户另要求）。
-- 当原文同时出现“工具隐喻/宣传口号”和“具体操作链路”时，优先总结具体操作链路，不要只保留抽象比喻。
-
-### B. X 汇报（演讲者主张框架版）
-把上述观点整理成适合在 X（Twitter）发布的“串帖/Thread”体例（10 条以内），要求：
-- 中性语气：这是“演讲者主张框架”，不是你已经验证的结论。
-- 每条 1–3 句中文，便于 thread 阅读；第一条是总览，最后一条写“风险：口误/听写、个人经历叙事、商业转化段落需分拆引用”等。
-- 不要输出 hashtag；不要编造转写里没有的步骤或产品功能。
-- 若某条观点涉及工具协同、知识库接入、资料比对，thread 中必须写清“原文中提供的信息是怎么结合”，避免只写成抽象金句或宣传口号。
-
-【完整转写文本】：
-{transcript}
-"""
-
-CHUNK_SUMMARY_USER_PROMPT_TEMPLATE = """以下是长转写文本的一个分段，标识：{chunk_label}。
-
-请只提炼这一段最重要的信息，供后续总汇总使用。请用简体中文输出以下结构，不要增加额外前言：
-
-### 分段概览
-用 2-4 句概括这段主要在讲什么。
-
-### 关键主张
-提取 1-3 条本段最重要的观点。每条必须包含：
-- 标题：
-- 说明：
-- 依据原文：
-- 中文直译：
-
-### 风险与不确定性
-- 若存在营销口径、个人叙事、口误/听写疑点、证据不足、产品能力未被充分证明等，逐条列出。
-
-要求：
-- 只总结当前这一段，不要补写本段没有出现的事实。
-- “依据原文”必须直接摘录本段原文中的连续短语或句子，不要编造。
-- 若本段信息有限，也要如实说明，不要为了凑条数而扩写。
-
-【当前分段原文】：
-{transcript}
-"""
-
-MERGE_SUMMARY_USER_PROMPT_TEMPLATE = """你将收到同一份长转写文本的多段摘要草稿。每段草稿已经包含该段的主张、原文摘录和中文直译。
-
-请基于这些分段摘要，输出最终结果，结构严格如下：
-
-### A. 内容总结与“主张—依据—中译”
-1) 先用 5-10 句中文概括全文主线（也可说明其语气更像演讲/口述/推广/教程中的哪一种）。
-2) 提取 5-8 条“核心观点/主张”。每条必须包含：
-   - 主张标题（简短）
-   - 主张说明（1-3 句中文）
-   - 依据：1-2 段【转写原文英文摘录】（只能使用分段摘要中已经出现的摘录）
-   - 对应【中文翻译】（忠实直译为主，专有名词不确定则标注“疑似：...”）
-
-要求：
-- 不要把营销数字（例如节省 X 小时）当成事实；若出现，标注为“演讲者声称/需核验”。
-- 若你发现明显的 ASR 误差，在段末用括注提示“疑似听写：...->...”。
-- 当原文同时出现“工具隐喻/宣传口号”和“具体操作链路”时，优先总结具体操作链路。
-- 只能使用分段摘要里已有信息，不要补写新的事实或新的原文引文。
-- 若证据不足，请明确标注“需核验”。
-
-### B. X 汇报（演讲者主张框架版）
-把上述观点整理成适合在 X（Twitter）发布的“串帖/Thread”体例（10 条以内），要求：
-- 中性语气：这是“演讲者主张框架”，不是你已经验证的结论。
-- 每条 1-3 句中文；第一条是总览，最后一条写风险提示。
-- 不要输出 hashtag；不要编造转写里没有的步骤或产品功能。
-- 若某条观点涉及工具协同、知识库接入、资料比对，thread 中必须写清“原文中提供的信息是怎么结合”的。
-
-【分段摘要】：
-{chunk_summaries}
-"""
-
 CONTEXT_LIMIT_PATTERNS = (
     "context length",
     "maximum context",
@@ -189,7 +82,167 @@ CONTEXT_LIMIT_PATTERNS = (
     "context_window_exceeded",
     "maximum length",
 )
+SENTENCE_BREAK_PATTERN = re.compile(r"(?<=[.?!。？！])\s+")
 
+SUMMARY_SYSTEM_PROMPT = (
+    "你是一位双语信息架构师。"
+    "请阅读用户提供的完整转写文本。"
+    "转写文本可能来自 ASR，可能含口误或听写错误。"
+    "请严格按照用户要求的 Markdown 结构输出简体中文结果，不要增加额外前言或说明。"
+)
+
+FORMAT_RULES = """
+Markdown 格式要求：
+- 所有输出必须是干净的 Markdown，不要写前言或额外说明。
+- 为了提升可读性，句末优先按 `. ? ! 。？！` 断行。
+- 不要输出超长自然段；一段里若有多句，请逐句换行。
+- 英文引文若包含多句，请放在同一个引用块中逐句换行。
+"""
+
+ANALYSIS_DIRECT_PROMPT_TEMPLATE = """你将阅读一份完整的视频转写文本，并输出“分析包”。
+
+目标：
+帮助用户快速判断作者到底在主张什么、拿了什么证据、哪些部分值得信、哪些部分需要警惕。
+
+请严格输出以下结构：
+
+### A. 内容主线总结
+用 5-8 句中文概括全文主线。
+每句单独成行。
+可点明这是演讲 / 推广 / 教程 / 经验分享中的哪一种语气。
+
+### B. 核心主张拆解
+提取 5-8 条最重要的主张。
+每条严格使用下面的字段格式：
+
+**主张1：标题**
+- 主张说明：
+- 证据原文：
+  > 英文原文摘录
+- 中文直译：
+  > 忠实直译
+- 类型判断：事实 / 观点 / 混合
+- 依据强度：强 / 中 / 弱
+- 风险标签：营销话术 / 夸大表达 / 听写疑点 / 需外部核验 / 个人经验叙事 / 无明显风险
+- 警惕原因：
+
+要求：
+- “证据原文”必须直接摘录转写里的连续短语或句子，不要编造。
+- 若原文只有个人经验或宣传口号，明确指出证据强度偏弱。
+- 不要把营销数字或效果承诺直接当成事实。
+- 对未经外部验证的效果、数字、因果、优劣结论，一律使用“作者声称 / 演讲者主张 / 原文展示 / 演示中展示”等归因措辞，不要改写成客观事实。
+- 若发现明显 ASR 疑点，可在中文直译或警惕原因中标注“疑似听写：A -> B”。
+- 风险提示只能基于 transcript 中已出现的信息，不得脑补隐藏动机。
+- 除非原文明确提到，否则不要推断“商业合作倾向 / 收钱推荐 / 广告植入”等隐藏关系。
+
+### C. 风险提示与核验点
+至少包含以下 4 组内容：
+- 事实性内容：哪些内容更接近可直接采信的信息
+- 需二次核验：哪些数字、因果、效果结论需要外部验证
+- 营销与夸大表达：哪些句子更像宣传、包装或情绪推动
+- ASR / 术语疑点：哪些专有名词、工具名、数据点可能听错
+
+### D. X 汇报
+把上述观点整理成适合在 X（Twitter）发布的“串帖 / Thread”体例，10 条以内：
+- 中性语气：这是“演讲者主张框架”，不是你已经验证的结论。
+- 每条 1-3 句。
+- 第一条做总览，最后一条做风险提示。
+- 不要输出 hashtag。
+- 若涉及工具协同、知识库接入、资料比对，必须写清原文中的组合方式。
+
+{format_rules}
+
+【完整转写文本】：
+{transcript}
+"""
+
+CHUNK_SUMMARY_USER_PROMPT_TEMPLATE = """以下是长转写文本的一个分段，标识：{chunk_label}。
+
+请只提炼这一段最重要的信息，供后续总汇总使用。
+请严格输出以下结构，不要增加额外前言：
+
+### 分段概览
+用 2-4 句概括这段在讲什么。
+每句单独成行。
+
+### 分段主张证据库
+提取 1-3 条本段最重要的主张。
+每条使用以下字段：
+
+**主张1：标题**
+- 主张说明：
+- 证据原文：
+- 中文直译：
+- 类型判断：事实 / 观点 / 混合
+- 依据强度：强 / 中 / 弱
+- 风险标签：营销话术 / 夸大表达 / 听写疑点 / 需外部核验 / 个人经验叙事 / 无明显风险
+- 警惕原因：
+
+### 分段风险与不确定性
+- 若存在营销口径、个人叙事、口误 / 听写疑点、证据不足、产品能力未被充分证明等，逐条列出。
+
+要求：
+- 只总结当前这一段，不要补写本段没有出现的事实。
+- “证据原文”必须直接摘录本段原文中的连续短语或句子，不要编造。
+- 若本段信息有限，也要如实说明，不要为了凑条数而扩写。
+- 对未经验证的效果、数字、因果，一律保留“作者声称 / 演讲者主张”的归因语气。
+- 不要推断隐藏动机或商业关系。
+- 句末优先按 `. ? ! 。？！` 断行，避免长段。
+
+【当前分段原文】：
+{transcript}
+"""
+
+ANALYSIS_MERGE_PROMPT_TEMPLATE = """你将收到同一份长转写文本的多段摘要草稿。
+每段草稿已经包含分段主张、原文摘录、中文直译、类型判断和风险标签。
+
+请基于这些分段摘要，输出最终“分析包”，结构严格如下：
+
+### A. 内容主线总结
+用 5-8 句中文概括全文主线。
+每句单独成行。
+
+### B. 核心主张拆解
+提取 5-8 条最重要的主张。
+每条严格使用下面的字段格式：
+
+**主张1：标题**
+- 主张说明：
+- 证据原文：
+  > 英文原文摘录
+- 中文直译：
+  > 忠实直译
+- 类型判断：事实 / 观点 / 混合
+- 依据强度：强 / 中 / 弱
+- 风险标签：营销话术 / 夸大表达 / 听写疑点 / 需外部核验 / 个人经验叙事 / 无明显风险
+- 警惕原因：
+
+### C. 风险提示与核验点
+- 事实性内容：
+- 需二次核验：
+- 营销与夸大表达：
+- ASR / 术语疑点：
+
+### D. X 汇报
+把上述观点整理成适合在 X（Twitter）发布的“串帖 / Thread”体例，10 条以内：
+- 中性语气：这是“演讲者主张框架”，不是你已经验证的结论。
+- 每条 1-3 句。
+- 第一条做总览，最后一条做风险提示。
+- 不要输出 hashtag。
+- 若涉及工具协同、知识库接入、资料比对，必须写清原文中的组合方式。
+
+要求：
+- 只能使用分段摘要里已有信息，不要补写新的事实或新的原文引文。
+- 若证据不足，请明确标注“需核验”。
+- 不要把营销数字或效果承诺当成事实。
+- 对未经外部验证的效果、数字、因果、优劣结论，一律使用“作者声称 / 演讲者主张 / 原文展示 / 演示中展示”等归因措辞。
+- 风险提示只能基于 transcript 已出现的信息，不得脑补隐藏动机。
+- 除非原文明确提到，否则不要推断“商业合作倾向 / 收钱推荐 / 广告植入”等隐藏关系。
+- 句末优先按 `. ? ! 。？！` 断行，避免长段。
+
+【分段摘要】：
+{chunk_summaries}
+"""
 
 def _extract_llm_content(payload: dict) -> str:
     return (
@@ -322,6 +375,104 @@ def _call_llm_with_retry(
     raise RuntimeError("LLM request failed after retries")
 
 
+def _request_markdown_output(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+) -> tuple[str, float]:
+    return _call_llm_with_retry(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        messages=[
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+
+def _count_pattern(pattern: str, text: str) -> int:
+    return len(re.findall(pattern, text, flags=re.MULTILINE))
+
+
+def _section_lines(markdown: str, heading: str) -> list[str]:
+    pattern = re.compile(
+        rf"(?ms)^###\s+{re.escape(heading)}\n(.*?)(?=^###\s+|\Z)"
+    )
+    match = pattern.search(markdown)
+    if not match:
+        return []
+    return [line.strip() for line in match.group(1).splitlines() if line.strip()]
+
+
+def _validate_analysis_markdown(markdown: str) -> list[str]:
+    issues: list[str] = []
+    claim_count = _count_pattern(r"^\*\*主张\d+：", markdown)
+    if claim_count < MIN_CLAIM_ITEMS:
+        issues.append(f"核心主张数量不足，至少需要 {MIN_CLAIM_ITEMS} 条。")
+
+    summary_lines = _section_lines(markdown, "A. 内容主线总结")
+    if summary_lines:
+        attributed_lines = sum(
+            1 for line in summary_lines if any(token in line for token in ("作者", "演讲者", "原文", "演示"))
+        )
+        if attributed_lines < max(2, min(3, len(summary_lines))):
+            issues.append("内容主线总结对未经验证的结论归因不足，应更多使用“作者声称/演讲者主张/原文展示”等措辞。")
+
+    forbidden_hidden_motive_phrases = (
+        "商业合作倾向",
+        "收钱推荐",
+        "广告植入",
+        "恰饭",
+        "利益输送",
+    )
+    if any(phrase in markdown for phrase in forbidden_hidden_motive_phrases):
+        issues.append("出现了 transcript 未明确支持的隐藏动机推断，应删除这类脑补风险。")
+
+    return issues
+
+
+def _generate_with_validation(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    validator,
+    label: str,
+) -> tuple[str, float]:
+    total_elapsed = 0.0
+    effective_prompt = prompt
+    last_issues: list[str] = []
+
+    for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+        content, elapsed = _request_markdown_output(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            prompt=effective_prompt,
+        )
+        total_elapsed += elapsed
+        issues = validator(content)
+        if not issues:
+            return content, round(total_elapsed, 3)
+
+        last_issues = issues
+        logging.warning("%s validation failed on attempt %s: %s", label, attempt, "; ".join(issues))
+        if attempt == MAX_GENERATION_ATTEMPTS:
+            break
+
+        effective_prompt = (
+            f"{prompt}\n\n"
+            "上一次输出未达标，请只修正以下问题后重新完整输出，不要解释：\n"
+            + "\n".join(f"- {issue}" for issue in issues)
+        )
+
+    raise RuntimeError(f"{label} generation failed validation: {'; '.join(last_issues)}")
+
+
 def _summarize_chunk_recursive(
     *,
     transcript: str,
@@ -332,20 +483,14 @@ def _summarize_chunk_recursive(
     depth: int = 0,
 ) -> tuple[list[str], float]:
     try:
-        content, elapsed = _call_llm_with_retry(
+        content, elapsed = _request_markdown_output(
             api_key=api_key,
             base_url=base_url,
             model=model,
-            messages=[
-                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": CHUNK_SUMMARY_USER_PROMPT_TEMPLATE.format(
-                        chunk_label=chunk_label,
-                        transcript=transcript,
-                    ),
-                },
-            ],
+            prompt=CHUNK_SUMMARY_USER_PROMPT_TEMPLATE.format(
+                chunk_label=chunk_label,
+                transcript=transcript,
+            ),
         )
         logging.info("Chunk %s summarized in %.3fs (%s chars)", chunk_label, elapsed, len(transcript))
         return [f"## Chunk {chunk_label}\n\n{content}"], elapsed
@@ -382,6 +527,66 @@ def _summarize_chunk_recursive(
         raise
 
 
+def _split_sentence_like(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text.strip())
+    if not normalized:
+        return []
+    return [part.strip() for part in SENTENCE_BREAK_PATTERN.split(normalized) if part.strip()]
+
+
+def _format_markdown_line(line: str) -> list[str]:
+    stripped = line.strip()
+    if not stripped:
+        return [""]
+    if stripped.startswith("#") or stripped.startswith("|"):
+        return [line.rstrip()]
+
+    quote_match = re.match(r"^(\s*>\s?)(.*)$", line)
+    if quote_match:
+        prefix, content = quote_match.groups()
+        parts = _split_sentence_like(content)
+        return [f"{prefix}{part}" for part in parts] or [line.rstrip()]
+
+    list_match = re.match(r"^(\s*(?:[-*+]|\d+\.)\s+)(.*)$", line)
+    if list_match:
+        prefix, content = list_match.groups()
+        parts = _split_sentence_like(content)
+        if len(parts) <= 1:
+            return [line.rstrip()]
+        continuation_prefix = " " * len(prefix)
+        return [f"{prefix}{parts[0]}"] + [f"{continuation_prefix}{part}" for part in parts[1:]]
+
+    parts = _split_sentence_like(line)
+    return parts or [line.rstrip()]
+
+
+def _format_markdown_sentences(markdown: str) -> str:
+    lines = markdown.strip().splitlines()
+    if not lines:
+        return ""
+
+    formatted_lines: list[str] = []
+    in_code_block = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            formatted_lines.append(line.rstrip())
+            continue
+        if in_code_block:
+            formatted_lines.append(line.rstrip())
+            continue
+        formatted_lines.extend(_format_markdown_line(line.rstrip()))
+
+    return "\n".join(formatted_lines).strip() + "\n"
+
+
+def _derive_output_path(input_path: Path, output_arg: str) -> Path:
+    if not output_arg:
+        return input_path.with_name(f"{input_path.stem}_analysis.md")
+    return Path(output_arg).expanduser().resolve()
+
+
 def summarize_transcript_with_llm(
     transcript: str,
     env_path: str | Path = DEFAULT_ENV_PATH,
@@ -392,19 +597,22 @@ def summarize_transcript_with_llm(
 
     transcript = transcript.strip()
     if len(transcript) <= DIRECT_SUMMARY_CHAR_BUDGET:
-        content, elapsed = _call_llm_with_retry(
+        analysis_content, analysis_elapsed = _generate_with_validation(
             api_key=api_key,
             base_url=base_url,
             model=model,
-            messages=[
-                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": SUMMARY_USER_PROMPT_TEMPLATE.format(transcript=transcript),
-                },
-            ],
+            prompt=ANALYSIS_DIRECT_PROMPT_TEMPLATE.format(
+                transcript=transcript,
+                format_rules=FORMAT_RULES.strip(),
+            ),
+            validator=_validate_analysis_markdown,
+            label="analysis pack",
         )
-        return content, model, elapsed
+        return (
+            _format_markdown_sentences(analysis_content),
+            model,
+            round(analysis_elapsed, 3),
+        )
 
     chunks = _split_transcript_into_chunks(transcript, CHUNK_CHAR_BUDGET)
     logging.info(
@@ -426,26 +634,25 @@ def summarize_transcript_with_llm(
         chunk_summaries.extend(summaries)
         total_elapsed += elapsed
 
-    merged_content, merge_elapsed = _call_llm_with_retry(
+    chunk_summary_text = "\n\n".join(chunk_summaries)
+    analysis_content, analysis_elapsed = _generate_with_validation(
         api_key=api_key,
         base_url=base_url,
         model=model,
-        messages=[
-            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": MERGE_SUMMARY_USER_PROMPT_TEMPLATE.format(
-                    chunk_summaries="\n\n".join(chunk_summaries)
-                ),
-            },
-        ],
+        prompt=ANALYSIS_MERGE_PROMPT_TEMPLATE.format(chunk_summaries=chunk_summary_text),
+        validator=_validate_analysis_markdown,
+        label="analysis pack",
     )
-    total_elapsed += merge_elapsed
-    return merged_content, model, round(total_elapsed, 3)
+    total_elapsed += analysis_elapsed
+    return (
+        _format_markdown_sentences(analysis_content),
+        model,
+        round(total_elapsed, 3),
+    )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Structured Chinese summary from transcript text")
+    parser = argparse.ArgumentParser(description="Structured analysis pack from transcript text")
     parser.add_argument(
         "--input",
         default=str(DEFAULT_INPUT_PATH),
@@ -454,7 +661,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         default="",
-        help="Optional markdown output path",
+        help="Optional analysis markdown output path",
     )
     parser.add_argument(
         "--env-path",
@@ -486,16 +693,12 @@ def main() -> int:
         )
         return 1
 
-    output_path = (
-        Path(args.output).expanduser().resolve()
-        if args.output
-        else input_path.with_name(f"{input_path.stem}_summary.md")
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    analysis_path = _derive_output_path(input_path, args.output)
+    analysis_path.parent.mkdir(parents=True, exist_ok=True)
 
     logging.info("Starting transcript summary")
     logging.info("Input path: %s", input_path)
-    logging.info("Output path: %s", output_path)
+    logging.info("Output path: %s", analysis_path)
     logging.info("Env path: %s", Path(args.env_path).expanduser().resolve())
 
     transcript = input_path.read_text(encoding="utf-8").strip()
@@ -505,7 +708,7 @@ def main() -> int:
         return 1
 
     try:
-        summary, model, elapsed = summarize_transcript_with_llm(
+        analysis_md, model, elapsed = summarize_transcript_with_llm(
             transcript,
             env_path=str(Path(args.env_path).expanduser().resolve()),
         )
@@ -522,12 +725,12 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    output_path.write_text(summary + "\n", encoding="utf-8")
+    analysis_path.write_text(analysis_md, encoding="utf-8")
 
     logging.info("Transcript summary finished in %.3fs", elapsed)
     logging.info("Summary model: %s", model)
 
-    print(f"Summary written to: {output_path}")
+    print(f"Analysis written to: {analysis_path}")
     print(f"Summary model: {model}")
     print(f"Summary seconds: {elapsed}")
     return 0

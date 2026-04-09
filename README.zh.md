@@ -4,7 +4,8 @@
 
 在苹果芯片（已在 Mac mini M4 16 GB 上测试）本地运行
 [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)，
-并将输出接入 LLM 清洗与结构化中文总结流程的独立可行性验证工作空间。
+并将输出接入 LLM 清洗，以及两个结构化后处理产物：
+分析包。
 
 本工作空间只回答一个具体问题：
 
@@ -24,8 +25,8 @@ poc_cohere_local_transcribe.py   ← 本地 ASR（transformers + MPS）
 transcript_cleanup.py            ← LLM 去重 / 标点补全
     │  output/transcript_cleaned.txt
     ▼
-transcript_summary.py            ← LLM 结构化中文总结
-       output/transcript_cleaned_summary.md
+transcript_summary.py            ← LLM 分析包
+       output/transcript_cleaned_analysis.md
 ```
 
 每个阶段都是独立脚本，可单独运行。
@@ -162,8 +163,15 @@ LLM_MODEL=deepseek-ai/DeepSeek-V3
 
 ```bash
 ./.venv/bin/python ./scripts/transcript_summary.py \
+  --input ./output/transcript_cleaned.txt
+```
+
+如需显式指定分析包路径，可传 `--output`：
+
+```bash
+./.venv/bin/python ./scripts/transcript_summary.py \
   --input ./output/transcript_cleaned.txt \
-  --output ./output/transcript_cleaned_summary.md
+  --output ./output/transcript_cleaned_analysis.md
 ```
 
 ---
@@ -174,7 +182,7 @@ LLM_MODEL=deepseek-ai/DeepSeek-V3
 |------|------|
 | `output/transcript.txt` | ASR 原始输出 |
 | `output/transcript_cleaned.txt` | LLM 去重 + 标点补全后的转写 |
-| `output/transcript_cleaned_summary.md` | 结构化中文总结 + X 串帖草稿 |
+| `output/transcript_cleaned_analysis.md` | 主张 / 证据 / 风险提示分析包 + X 串帖草稿 |
 | `output/report.json` | 运行基准报告：模型路径、Python/torch 版本、设备、音频时长、加载时间、转写时间、RSS 内存 |
 | `logs/poc_cohere_local_transcribe.log` | ASR 运行日志 |
 | `logs/transcript_cleanup.log` | 清洗运行日志 |
@@ -186,4 +194,5 @@ LLM_MODEL=deepseek-ai/DeepSeek-V3
 
 - 转写输出出现多语言乱码时，最常见原因是 `transformers` 版本不在支持范围内，检查 `requirements.txt` 中的版本约束。
 - LLM 清洗和总结步骤是独立模块，可以不依赖 ASR 步骤单独调用或导入。
-- 总结提示词针对 URL 来源的视频转写进行了优化，输出包含"主张—依据—中译"结构化表格以及适合在 X（Twitter）发布的串帖草稿。
+- 总结阶段现在默认输出一个 Markdown：用于 `主张 / 证据 / 风险` 分析。
+- 最终 Markdown 会做可读性后处理，尽量在 `. ? !` 与 `。？！` 后优先换行，避免大段文本堆叠。
