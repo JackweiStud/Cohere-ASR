@@ -1,4 +1,31 @@
 #!/usr/bin/env python3
+"""对 ASR 转写文本做最小改动清洗。
+
+职责范围
+    只负责读取已有的转写文本，调用配置好的 LLM 做 minimum-edit cleanup，
+    输出清洗后的 ``*_cleaned.txt``。不负责语音转写；语音转写请使用
+    ``poc_cohere_local_transcribe.py``。
+
+使用示例（建议在项目虚拟环境中执行）::
+    /path/to/.venv/bin/python scripts/transcript_cleanup.py \\
+        --input output/transcript.txt \\
+        --output output/transcript_cleaned.txt
+
+主要参数
+    --input     输入转写文本路径。当前建议使用 ``.txt``，例如 ``output/transcript.txt``。
+    --output    可选；输出路径。默认与输入同目录，文件名自动加 ``_cleaned`` 后缀。
+    --log-path  日志文件路径。默认 ``logs/transcript_cleanup.log``。
+
+LLM 配置
+    默认读取项目根目录下的 ``.env``（与 ``scripts/`` 同级），**无需在命令行传任何 env 参数**。
+    仅在需要使用非默认路径时，才传入 ``--env-path`` 覆盖。
+
+注意事项
+    - 需要在环境变量或项目根 ``.env`` 中提供 ``LLM_API_KEY``；``LLM_BASE_URL`` 和
+      ``LLM_MODEL`` 可选，不填则使用默认值。
+    - 若输入不是 ``.txt``，脚本会记录错误日志并提示先提供文本转写结果。
+    - 该脚本使用 ``temperature=0``，尽量保持最小修改。
+"""
 
 from __future__ import annotations
 
@@ -12,8 +39,10 @@ from pathlib import Path
 import httpx
 
 
-DEFAULT_ENV_PATH = "/Users/jackwl/Code/test/.env"
-DEFAULT_LOG_PATH = "/Users/jackwl/Code/test/logs/transcript_cleanup.log"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
+DEFAULT_LOG_PATH = PROJECT_ROOT / "logs" / "transcript_cleanup.log"
 
 
 def configure_logging(log_path: str) -> None:
@@ -47,7 +76,7 @@ def load_env_file(env_path: str) -> dict[str, str]:
     return data
 
 
-def resolve_llm_settings(env_path: str = DEFAULT_ENV_PATH) -> tuple[str, str, str]:
+def resolve_llm_settings(env_path: str | Path = DEFAULT_ENV_PATH) -> tuple[str, str, str]:
     file_env = load_env_file(env_path)
     api_key = os.environ.get("LLM_API_KEY") or file_env.get("LLM_API_KEY", "")
     base_url = os.environ.get("LLM_BASE_URL") or file_env.get("LLM_BASE_URL", "https://api.openai.com/v1")
@@ -78,7 +107,7 @@ def strip_cleanup_preamble(text: str) -> str:
 
 def cleanup_transcript_with_llm(
     transcript: str,
-    env_path: str = DEFAULT_ENV_PATH,
+    env_path: str | Path = DEFAULT_ENV_PATH,
 ) -> tuple[str, str, float]:
     api_key, base_url, model = resolve_llm_settings(env_path)
     if not api_key or not model:
@@ -152,17 +181,35 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Light cleanup for ASR transcript text")
     parser.add_argument("--input", required=True, help="Path to transcript txt file")
     parser.add_argument("--output", default="", help="Optional cleaned transcript path")
-    parser.add_argument("--env-path", default=DEFAULT_ENV_PATH, help="Path to local .env file")
-    parser.add_argument("--log-path", default=DEFAULT_LOG_PATH, help="Path to log file")
+    parser.add_argument(
+        "--env-path",
+        default=str(DEFAULT_ENV_PATH),
+        help="可选。覆盖 LLM 配置 .env；默认使用项目根目录 .env，通常不必传入。",
+    )
+    parser.add_argument("--log-path", default=str(DEFAULT_LOG_PATH), help="Path to log file")
     args = parser.parse_args()
 
     input_path = Path(args.input).expanduser().resolve()
+    configure_logging(str(Path(args.log_path).expanduser().resolve()))
+
     if not input_path.exists():
+        logging.error("Input file not found: %s", input_path)
         print(f"Input file not found: {input_path}", file=sys.stderr)
         return 1
 
+    if input_path.suffix.lower() != ".txt":
+        logging.error("Unsupported input format: %s", input_path.suffix or "<no suffix>")
+        logging.error("This script currently accepts only .txt transcript input: %s", input_path)
+        print(
+            "Unsupported input format. This script currently accepts only .txt transcript input.\n"
+            f"Input path: {input_path}\n"
+            "Suggestion: provide the transcript text file first, such as output/transcript.txt.",
+            file=sys.stderr,
+        )
+        return 1
+
     output_path = Path(args.output).expanduser().resolve() if args.output else input_path.with_name(f"{input_path.stem}_cleaned.txt")
-    configure_logging(str(Path(args.log_path).expanduser().resolve()))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     logging.info("Starting transcript cleanup")
     logging.info("Input path: %s", input_path)
@@ -170,7 +217,25 @@ def main() -> int:
     logging.info("Env path: %s", Path(args.env_path).expanduser().resolve())
 
     transcript = input_path.read_text(encoding="utf-8").strip()
-    cleaned, model, elapsed = cleanup_transcript_with_llm(transcript, env_path=str(Path(args.env_path).expanduser().resolve()))
+    if not transcript:
+        logging.warning("Input transcript is empty: %s", input_path)
+        print(f"Input transcript is empty: {input_path}", file=sys.stderr)
+        return 1
+
+    try:
+        cleaned, model, elapsed = cleanup_transcript_with_llm(
+            transcript,
+            env_path=str(Path(args.env_path).expanduser().resolve()),
+        )
+    except httpx.HTTPError as exc:
+        logging.error("Transcript cleanup request failed: %s", exc)
+        print(
+            "Transcript cleanup request failed. Please check LLM_API_KEY, LLM_BASE_URL, "
+            "LLM_MODEL, network connectivity, and server availability.",
+            file=sys.stderr,
+        )
+        return 2
+
     output_path.write_text(cleaned + "\n", encoding="utf-8")
 
     logging.info("Transcript cleanup finished in %.3fs", elapsed)
