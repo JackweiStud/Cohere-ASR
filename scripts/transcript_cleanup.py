@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -43,6 +44,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "logs" / "transcript_cleanup.log"
+DEFAULT_CHUNK_MAX_CHARS = 4000
+DEFAULT_CHUNK_MIN_CHARS = 1200
+
+_CHUNK_BREAK_PATTERNS = (
+    "\n\n",
+    "\n",
+    " ",
+)
+_LINE_BREAK_CHARS = {".", "。", "?", "？", "!", "！"}
 
 
 def configure_logging(log_path: str) -> None:
@@ -105,6 +115,156 @@ def strip_cleanup_preamble(text: str) -> str:
     return stripped
 
 
+def _should_break_after_char(text: str, index: int) -> bool:
+    ch = text[index]
+    if ch not in _LINE_BREAK_CHARS:
+        return False
+
+    prev_char = text[index - 1] if index > 0 else ""
+    next_char = text[index + 1] if index + 1 < len(text) else ""
+
+    if ch == "." and prev_char.isdigit() and next_char.isdigit():
+        return False
+
+    return True
+
+
+def _format_plain_text_with_line_breaks(text: str) -> str:
+    normalized = (text or "").strip()
+    if not normalized:
+        return ""
+
+    lines: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        chunk = "".join(current).strip()
+        if chunk:
+            lines.append(chunk)
+        current.clear()
+
+    for idx, ch in enumerate(normalized):
+        current.append(ch)
+        if _should_break_after_char(normalized, idx):
+            flush()
+
+    flush()
+    return "\n".join(lines).strip()
+
+
+def _find_chunk_split(text: str, start: int, end: int, min_chunk_chars: int) -> int | None:
+    search_start = max(start + min_chunk_chars, start + 1)
+    best_split: int | None = None
+
+    for pattern in _CHUNK_BREAK_PATTERNS:
+        idx = text.rfind(pattern, search_start, end)
+        if idx == -1:
+            continue
+        candidate = idx + len(pattern)
+        if candidate <= start or candidate >= end:
+            continue
+        if best_split is None or candidate > best_split:
+            best_split = candidate
+
+    return best_split
+
+
+def _split_transcript_for_cleanup(transcript: str, max_chars: int) -> list[str]:
+    text = (transcript or "").strip()
+    if not text:
+        return []
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text]
+
+    min_chunk_chars = max(1, min(DEFAULT_CHUNK_MIN_CHARS, max_chars // 2))
+    chunks: list[str] = []
+    start = 0
+
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        if end >= len(text):
+            chunk = text[start:].strip()
+            if chunk:
+                chunks.append(chunk)
+            break
+
+        split_at = _find_chunk_split(text, start, end, min_chunk_chars)
+        if split_at is None or split_at <= start:
+            split_at = end
+
+        chunk = text[start:split_at].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = split_at
+
+    return chunks
+
+
+def _cleanup_transcript_chunk_with_retry(
+    transcript: str,
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    max_attempts: int = 2,
+) -> tuple[str, str, float, bool]:
+    last_error = ""
+    total_elapsed = 0.0
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            cleaned, model, elapsed = cleanup_transcript_with_llm(transcript, env_path=env_path)
+            total_elapsed += elapsed
+            return cleaned, model, round(total_elapsed, 3), True
+        except httpx.HTTPError as exc:
+            last_error = str(exc)
+            total_elapsed += 0.0
+            logging.warning(
+                "Cleanup chunk attempt %s/%s failed: %s",
+                attempt,
+                max_attempts,
+                last_error,
+            )
+            if attempt >= max_attempts:
+                break
+
+    return _format_plain_text_with_line_breaks(transcript), "", round(total_elapsed, 3), False
+
+
+def cleanup_transcript_in_chunks(
+    transcript: str,
+    env_path: str | Path = DEFAULT_ENV_PATH,
+    max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
+) -> tuple[str, str, float, int, int]:
+    chunks = _split_transcript_for_cleanup(transcript, max_chars=max_chars)
+    if not chunks:
+        return "", "", 0.0, 0, 0
+
+    if len(chunks) == 1:
+        cleaned, model, elapsed = cleanup_transcript_with_llm(chunks[0], env_path=env_path)
+        return cleaned, model, elapsed, 1, 0
+
+    logging.info("Split transcript into %s cleanup chunk(s)", len(chunks))
+    cleaned_chunks: list[str] = []
+    model_name = ""
+    total_elapsed = 0.0
+    failed_chunks = 0
+
+    for idx, chunk in enumerate(chunks, 1):
+        logging.info("Cleaning chunk %s/%s (%s chars)", idx, len(chunks), len(chunk))
+        cleaned, model, elapsed, success = _cleanup_transcript_chunk_with_retry(
+            chunk,
+            env_path=env_path,
+        )
+        total_elapsed += elapsed
+        if model:
+            model_name = model
+        if not success:
+            failed_chunks += 1
+            logging.warning("Chunk %s cleanup failed; keeping original text", idx)
+        cleaned_chunks.append(cleaned.strip())
+
+    merged = "\n".join(part for part in cleaned_chunks if part).strip()
+    return merged, model_name, round(total_elapsed, 3), len(chunks), failed_chunks
+
+
 def cleanup_transcript_with_llm(
     transcript: str,
     env_path: str | Path = DEFAULT_ENV_PATH,
@@ -112,7 +272,7 @@ def cleanup_transcript_with_llm(
     api_key, base_url, model = resolve_llm_settings(env_path)
     if not api_key or not model:
         logging.warning("Skipping transcript cleanup because LLM settings are incomplete")
-        return transcript, "", 0.0
+        return _format_plain_text_with_line_breaks(transcript), "", 0.0
 
     system_prompt = (
         "You are an ASR transcript cleanup assistant. "
@@ -173,8 +333,8 @@ def cleanup_transcript_with_llm(
     cleaned = strip_cleanup_preamble(cleaned)
     if not cleaned:
         logging.warning("Cleanup LLM returned empty content; keeping original transcript")
-        return transcript, model, elapsed
-    return cleaned, model, elapsed
+        return _format_plain_text_with_line_breaks(transcript), model, elapsed
+    return _format_plain_text_with_line_breaks(cleaned), model, elapsed
 
 
 def main() -> int:
@@ -223,7 +383,7 @@ def main() -> int:
         return 1
 
     try:
-        cleaned, model, elapsed = cleanup_transcript_with_llm(
+        cleaned, model, elapsed, chunk_count, failed_chunk_count = cleanup_transcript_in_chunks(
             transcript,
             env_path=str(Path(args.env_path).expanduser().resolve()),
         )
@@ -239,6 +399,8 @@ def main() -> int:
     output_path.write_text(cleaned + "\n", encoding="utf-8")
 
     logging.info("Transcript cleanup finished in %.3fs", elapsed)
+    logging.info("Cleanup chunks: %s", chunk_count)
+    logging.info("Failed cleanup chunks: %s", failed_chunk_count)
     if model:
         logging.info("Cleanup model: %s", model)
 
@@ -246,6 +408,8 @@ def main() -> int:
     if model:
         print(f"Cleanup model: {model}")
         print(f"Cleanup seconds: {elapsed}")
+        print(f"Cleanup chunks: {chunk_count}")
+        print(f"Failed cleanup chunks: {failed_chunk_count}")
     return 0
 
 

@@ -24,6 +24,7 @@ htmlcov/
 
 # 运行产物与日志
 logs/
+input/
 output/
 
 # 本地下载的模型权重（见 scripts/download_model.sh）
