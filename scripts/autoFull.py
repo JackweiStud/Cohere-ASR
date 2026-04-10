@@ -126,7 +126,7 @@ def run_pipeline() -> int:
     logging.info("RSS after load: %.2fMB", rss_after_load_mb)
 
     transcribe_begin = time.time()
-    chunk_results, _failed_chunk_count = _transcribe_chunks(
+    chunk_results = _transcribe_chunks(
         model=model,
         processor=processor,
         torch_module=torch,
