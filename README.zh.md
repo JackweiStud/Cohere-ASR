@@ -4,7 +4,7 @@
 
 在苹果芯片（已在 Mac mini M4 16 GB 上测试）本地运行
 [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)，
-并将输出接入 LLM 清洗，以及两个结构化后处理产物：
+并将输出接入可选的 LLM 清洗，以及两个结构化后处理产物：
 分析包。
 
 本工作空间只回答一个具体问题：
@@ -22,10 +22,10 @@ input/audio.wav
 poc_cohere_local_transcribe.py   ← 本地 ASR（transformers + MPS）
     │  output/transcript.txt
     ▼
-transcript_cleanup.py            ← LLM 去重 / 标点补全
+transcript_cleanup.py            ← 可选：LLM 去重 / 标点补全 / 自动换行
     │  output/transcript_cleaned.txt
     ▼
-transcript_summary.py            ← LLM 分析包
+transcript_summary.py            ← LLM 分析包（可直接读 transcript.txt 或 transcript_cleaned.txt）
        output/transcript_cleaned_analysis.md
 ```
 
@@ -47,6 +47,7 @@ transcript_summary.py            ← LLM 分析包
 ├── output/                ← 生成的转写与总结（已 git-ignore）
 ├── requirements.txt
 ├── scripts/
+│   ├── autoFull.py
 │   ├── autoFull.sh
 │   ├── download_model.sh
 │   ├── setup_venv.sh
@@ -118,12 +119,24 @@ LLM_MODEL=deepseek-ai/DeepSeek-V3
 
 ## 运行
 
-### 完整管线（转写 → 清洗 → 总结）
+### 完整管线（转写 → 可选清洗 → 总结）
 
-一条命令跑完全部流程：
+一条命令跑完全部流程，优先推荐 Python CLI：
+
+```bash
+./scripts/autoFull.py
+```
+
+shell 包装器仍然保留，兼容旧入口：
 
 ```bash
 ./scripts/autoFull.sh
+```
+
+默认会跳过清洗步骤；如需先清洗再总结，可显式开启：
+
+```bash
+./scripts/autoFull.sh --enCleanUp 1
 ```
 
 所有参数均为可选，不填则使用默认值：
@@ -182,6 +195,7 @@ LLM_MODEL=deepseek-ai/DeepSeek-V3
 |------|------|
 | `output/transcript.txt` | ASR 原始输出 |
 | `output/transcript_cleaned.txt` | LLM 去重 + 标点补全后的转写 |
+| `output/transcript_analysis.md` | 直接基于原始转写生成的分析包 |
 | `output/transcript_cleaned_analysis.md` | 主张 / 证据 / 风险提示分析包 + X 串帖草稿 |
 | `output/report.json` | 运行基准报告：模型路径、Python/torch 版本、设备、音频时长、加载时间、转写时间、RSS 内存 |
 | `logs/poc_cohere_local_transcribe.log` | ASR 运行日志 |

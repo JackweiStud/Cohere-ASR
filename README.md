@@ -5,7 +5,7 @@
 A self-contained local feasibility workspace for running
 [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)
 on Apple Silicon (tested on Mac mini M4 16 GB) and piping the output through an
-LLM-based cleanup plus one structured post-processing output:
+optional LLM-based cleanup plus one structured post-processing output:
 an analysis pack.
 
 The workspace answers one concrete question:
@@ -24,10 +24,10 @@ input/audio.wav
 poc_cohere_local_transcribe.py   ← local ASR (transformers + MPS)
     │  output/transcript.txt
     ▼
-transcript_cleanup.py            ← LLM dedup / punctuation pass
+transcript_cleanup.py            ← optional LLM dedup / punctuation pass
     │  output/transcript_cleaned.txt
     ▼
-transcript_summary.py            ← LLM analysis pack
+transcript_summary.py            ← LLM analysis pack (can read transcript.txt or transcript_cleaned.txt)
        output/transcript_cleaned_analysis.md
 ```
 
@@ -49,6 +49,7 @@ Each stage is an independent script and can be run in isolation.
 ├── output/                ← generated transcripts and summaries (git-ignored)
 ├── requirements.txt
 ├── scripts/
+│   ├── autoFull.py
 │   ├── autoFull.sh
 │   ├── download_model.sh
 │   ├── setup_venv.sh
@@ -124,12 +125,24 @@ they are absent.
 
 ## Run
 
-### Full pipeline (transcribe → cleanup → summary)
+### Full pipeline (transcribe → optional cleanup → summary)
 
-The quickest way to run everything in one shot:
+The quickest way to run everything in one shot is the Python CLI:
+
+```bash
+./scripts/autoFull.py
+```
+
+The shell wrapper is kept for compatibility:
 
 ```bash
 ./scripts/autoFull.sh
+```
+
+Cleanup is skipped by default. To enable step 2, pass:
+
+```bash
+./scripts/autoFull.sh --enCleanUp 1
 ```
 
 All options are optional — defaults are picked up automatically:
@@ -188,6 +201,7 @@ Optional: explicitly set the analysis output path:
 |------|-------------|
 | `output/transcript.txt` | Raw ASR output |
 | `output/transcript_cleaned.txt` | LLM-deduped and punctuated transcript |
+| `output/transcript_analysis.md` | Analysis pack generated directly from the raw transcript |
 | `output/transcript_cleaned_analysis.md` | Claim/evidence/risk analysis pack + X thread draft |
 | `output/report.json` | Runtime benchmark — model path, Python/torch version, device, audio duration, load time, transcription time, RSS |
 | `logs/poc_cohere_local_transcribe.log` | ASR run log |
